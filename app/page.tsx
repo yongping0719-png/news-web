@@ -1,6 +1,39 @@
 import { headers } from "next/headers";
 import Link from "next/link";
+function getBaseUrl() {
+  // Vercel 线上
+  if (process.env.VERCEL_URL) {
+    return `https://${process.env.VERCEL_URL}`;
+  }
+  // 本地开发
+  return "http://localhost:3000";
+}
 
+async function fetchNews(src: string) {
+  const base = getBaseUrl();
+  const url = `${base}/api/news?src=${encodeURIComponent(src)}`;
+
+  const res = await fetch(url, { cache: "no-store" });
+
+  const text = await res.text();
+  const ct = res.headers.get("content-type") || "";
+
+  if (!res.ok) {
+    return {
+      ok: false,
+      error: `HTTP ${res.status}: ${text.slice(0, 200)}`,
+    };
+  }
+
+  if (!ct.includes("application/json")) {
+    return {
+      ok: false,
+      error: `返回的不是 JSON（${ct}），可能是 HTML 页面`,
+    };
+  }
+
+  return JSON.parse(text);
+}
 const SOURCES = [
   { key: "nhk", label: "NHK" },
   { key: "kyodo", label: "共同社" },
@@ -16,14 +49,7 @@ export default async function Home({
   const sp = await searchParams;               // ✅ 关键：await
   const src = sp?.src ?? "nhk";
 
-  const h = await headers();
-const host = h.get("host");
-const protocol = process.env.NODE_ENV === "development" ? "http" : "https";
-
-const res = await fetch(`${protocol}://${host}/api/news?src=${src}`, {
-  cache: "no-store",
-});
-const data = await res.json();
+  const data = await fetchNews(src);
 
   return (
     <main style={{ padding: 24 }}>
