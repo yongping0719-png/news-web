@@ -1,29 +1,19 @@
-// app/api/news/route.ts
 import { NextResponse } from "next/server";
 import { XMLParser } from "fast-xml-parser";
 
 export const runtime = "nodejs";
 
-const RSS_MAP: Record<string, string> = {
-  nhk: "https://www3.nhk.or.jp/rss/news/cat0.xml",
-  yahoo: "https://news.yahoo.co.jp/rss/topics/top-picks.xml",
-  cnn: "https://edition.cnn.com/rss/cnn_topstories.rss",
-  // kyodo: "把你的共同社RSS填在这里（你贴链接我帮你定）",
-};
+const WORKER_BASE =
+  process.env.NEWS_WORKER_BASE_URL || "https://young-tree-0724.yongping0719.workers.dev";
+// 例如： https://young-tree-0724.yongping0719.workers.dev
 
-function pickItems(parsed: any) {
-  // 兼容 RSS 2.0 / RDF / Atom 的常见结构
-  const channel = parsed?.rss?.channel;
-  const rssItems = channel?.item;
-
-  const items = Array.isArray(rssItems) ? rssItems : rssItems ? [rssItems] : [];
-
-  return items.slice(0, 30).map((it: any) => ({
-    title: it.title?.["#text"] ?? it.title ?? "",
-    link: it.link?.["#text"] ?? it.link ?? "",
-    pubDate: it.pubDate ?? it.date ?? "",
-    source: channel?.title?.["#text"] ?? channel?.title ?? "",
-  }));
+function json(data: any, status = 200) {
+  return NextResponse.json(data, {
+    status,
+    headers: {
+      "cache-control": "no-store",
+    },
+  });
 }
 
 export async function GET(req: Request) {
@@ -31,35 +21,53 @@ export async function GET(req: Request) {
     const { searchParams } = new URL(req.url);
     const src = (searchParams.get("src") || "nhk").toLowerCase();
 
-    const rssUrl = RSS_MAP[src];
-    if (!rssUrl) {
-      return NextResponse.json({ ok: false, error: `Unknown src: ${src}` }, { status: 400 });
-    }
+    const url = `${WORKER_BASE}/?src=${encodeURIComponent(src)}`;
 
-    const res = await fetch(rssUrl, {
+    const res = await fetch(url, {
       headers: {
-        // 很多站会拦 “无UA/像机器人”的请求
-        "user-agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-        accept: "application/rss+xml, application/xml;q=0.9, */*;q=0.8",
+        // 有些情况下加个 UA 更稳
+        "user-agent": "Mozilla/5.0 (RSS Proxy via Cloudflare Worker)",
+        accept: "application/json",
       },
       cache: "no-store",
     });
 
     const text = await res.text();
+    const ct = res.headers.get("content-type") || "";
+
     if (!res.ok) {
-      return NextResponse.json(
-        { ok: false, error: `HTTP ${res.status}: ${text.slice(0, 200)}` },
-        { status: 200 }
+      return json(
+        {
+          ok: false,
+          error: `Upstream ${res.status} ${res.statusText}`,
+          detail: text.slice(0, 500),
+        },
+        502
       );
     }
 
-    const parser = new XMLParser({ ignoreAttributes: false });
-    const parsed = parser.parse(text);
+    // Worker 应该返回 JSON；万一没返回也给你明确错误
+    if (!ct.includes("application/json")) {
+      return json(
+        {
+          ok: false,
+          error: `Upstream returned non-JSON (${ct || "unknown"})`,
+          detail: text.slice(0, 500),
+        },
+        502
+      );
+    }
 
-    const items = pickItems(parsed);
-    return NextResponse.json({ ok: true, items }, { status: 200 });
+    // 这里直接把 Worker 的 JSON 透传给前端
+    const data = JSON.parse(text);
+    return json(data, 200);
   } catch (e: any) {
-    return NextResponse.json({ ok: false, error: e?.message || String(e) }, { status: 200 });
+    return json(
+      {
+        ok: false,
+        error: e?.message || String(e),
+      },
+      500
+    );
   }
 }
