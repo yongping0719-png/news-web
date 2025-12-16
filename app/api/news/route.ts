@@ -1,77 +1,84 @@
 // app/api/news/route.ts
 import { NextResponse } from "next/server";
 
-export const runtime = "nodejs";
+export const runtime = "edge";
 
-function withCors(res: NextResponse) {
-  // 同源一般用不到，但加上不坏事，方便以后你前后端分离
-  res.headers.set("Access-Control-Allow-Origin", "*");
-  res.headers.set("Access-Control-Allow-Methods", "GET, OPTIONS");
-  res.headers.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  return res;
-}
+/**
+ * 只读橙云，不在 V网页 里直接抓 RSS（避免跨站、反爬、XML 解析差异等问题）
+ *
+ * 允许的 src：
+ * - nhk
+ * - yahoo
+ * - kyodo
+ * - cnn
+ *
+ * 访问示例：
+ * /api/news?src=nhk
+ */
+const ALLOWED = new Set(["nhk", "yahoo", "kyodo", "cnn"]);
 
-export async function OPTIONS() {
-  return withCors(new NextResponse(null, { status: 204 }));
-}
+// ✅ 你的橙云域名（按你要求：直接给完整可点开的）
+const WORKER_BASE = "https://young-tree-0724.yongping0719.workers.dev";
 
 export async function GET(req: Request) {
   try {
     const url = new URL(req.url);
     const src = (url.searchParams.get("src") || "nhk").toLowerCase();
 
-    // 你的橙云域名（可选：你也可以在 V网页 的环境变量里设置 NEWS_WORKER_BASE）
-    const WORKER_BASE =
-      process.env.NEWS_WORKER_BASE ||
-      "https://young-tree-0724.yongping0719.workers.dev";
-
-    const base = WORKER_BASE.replace(/\/+$/, "");
-    const target = `${base}/api/news?src=${encodeURIComponent(src)}`;
-
-    // 关键：这里只做“代理”，不做任何 RSS/XML 解析
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 12000);
-
-    const upstream = await fetch(target, {
-      method: "GET",
-      headers: {
-        Accept: "application/json",
-      },
-      signal: controller.signal,
-      // 让 V网页 不缓存旧数据（需要缓存的话我们下一步再加 s-maxage）
-      cache: "no-store",
-    }).finally(() => clearTimeout(timer));
-
-    const text = await upstream.text();
-
-    // 尝试按 JSON 返回；如果上游不是 JSON，就包一层错误返回
-    let data: any;
-    try {
-      data = JSON.parse(text);
-    } catch {
-      data = {
-        ok: false,
-        error: "Upstream returned non-JSON",
-        status: upstream.status,
-        target,
-        sample: text.slice(0, 500),
-      };
+    if (!ALLOWED.has(src)) {
+      return NextResponse.json(
+        { ok: false, error: "Invalid src", allowed: Array.from(ALLOWED) },
+        { status: 400 }
+      );
     }
 
-    // 把橙云的结果原样返回给前端
-    const res = NextResponse.json(data, { status: upstream.ok ? 200 : 502 });
-    res.headers.set("Cache-Control", "no-store");
-    return withCors(res);
+    // 转发到橙云
+    const upstream = `${WORKER_BASE}/api/news?src=${encodeURIComponent(src)}`;
+
+    const res = await fetch(upstream, {
+      // 轻量缓存：让边缘节点缓存一会儿，减少频繁打到橙云
+      // 你也可以之后再调大
+      next: { revalidate: 30 },
+      headers: {
+        // 传一个简单 UA（可选）
+        "User-Agent": "news-web (Vercel) proxy",
+        Accept: "application/json",
+      },
+    });
+
+    // 橙云返回非 200：把内容透传回来，方便你排错
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      return NextResponse.json(
+        {
+          ok: false,
+          error: `Upstream ${res.status}`,
+          upstream,
+          sample: text.slice(0, 300),
+        },
+        { status: 502 }
+      );
+    }
+
+    // 正常：把 JSON 原样转回给前端
+    const data = await res.json();
+
+    // 统一加一点缓存头（浏览器/边缘都能吃到）
+    return NextResponse.json(data, {
+      status: 200,
+      headers: {
+        // public: 允许 CDN 缓存；s-maxage: CDN 缓存 30s；stale-while-revalidate: 60s
+        "Cache-Control": "public, s-maxage=30, stale-while-revalidate=60",
+      },
+    });
   } catch (err: any) {
-    const res = NextResponse.json(
+    return NextResponse.json(
       {
         ok: false,
-        error: "V网页 api proxy failed",
+        error: "Server error",
         message: err?.message || String(err),
       },
       { status: 500 }
     );
-    res.headers.set("Cache-Control", "no-store");
-    return withCors(res);
   }
 }
