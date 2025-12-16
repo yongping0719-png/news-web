@@ -1,159 +1,152 @@
 // app/api/news/route.ts
 import { NextResponse } from "next/server";
-import { XMLParser } from "fast-xml-parser";
 
 export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
-// ✅ 只走 Worker（不要再直连任何 RSS 源站）
-const WORKER_BASE =
-  process.env.WORKER_BASE_URL || "https://young-tree-0724.yongping0719.workers.dev";
+type Src = "nhk" | "kyodo" | "yahoo" | "cnn";
 
-// 允许的来源（前端传 ?src=nhk / yahoo / cnn / kyodo）
-const ALLOWED = new Set(["nhk", "yahoo", "cnn", "kyodo"]);
+function normalizeSrc(raw: string | null): Src {
+  const v = (raw || "nhk").toLowerCase().trim();
+  if (v === "nhk" || v === "kyodo" || v === "yahoo" || v === "cnn") return v;
+  return "nhk";
+}
 
-function pickItems(parsed: any) {
-  // 兼容 RSS 2.0 / Atom / RDF 的常见结构
-  const rssChannel = parsed?.rss?.channel;
-  const rdfChannel = parsed?.RDF?.channel;
-  const atomFeed = parsed?.feed;
-
-  // RSS2 / RDF
-  const channel = rssChannel || rdfChannel;
-  const rssItems = channel?.item;
-
-  // Atom
-  const atomEntries = atomFeed?.entry;
-
-  // 统一成数组
-  const items = Array.isArray(rssItems)
-    ? rssItems
-    : rssItems
-    ? [rssItems]
-    : Array.isArray(atomEntries)
-    ? atomEntries
-    : atomEntries
-    ? [atomEntries]
-    : [];
-
-  // 取标题/链接/时间（做最大兼容）
-  return items.slice(0, 30).map((it: any) => {
-    // title
-    const title =
-      it?.title?.["#text"] ??
-      it?.title?._text ??
-      it?.title ??
-      it?.["atom:title"] ??
-      "";
-
-    // link（RSS: <link>xxx</link>；Atom: <link href="..."/> 或 link[]）
-    let link =
-      it?.link?.["#text"] ??
-      it?.link?._text ??
-      it?.link ??
-      "";
-
-    if (!link && it?.link?.["@_href"]) link = it.link["@_href"];
-    if (!link && Array.isArray(it?.link)) {
-      const alt =
-        it.link.find((x: any) => x?.["@_rel"] === "alternate") || it.link[0];
-      link = alt?.["@_href"] || "";
-    }
-
-    // pubDate / updated / date
-    const pubDate =
-      it?.pubDate ??
-      it?.updated ??
-      it?.date ??
-      it?.published ??
-      "";
-
-    return { title: String(title), link: String(link), pubDate: String(pubDate) };
+function jsonOk(payload: unknown, init?: ResponseInit) {
+  return NextResponse.json(payload, {
+    ...init,
+    headers: {
+      "cache-control": "no-store",
+      ...(init?.headers || {}),
+    },
   });
 }
 
+_toggle:
+function withTimeout(ms: number) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  return { signal: ctrl.signal, clear: () => clearTimeout(timer) };
+}
+
+/**
+ * 你要把下面这个地址改成你自己的橙云地址（workers.dev）
+ * 例如：
+ *   https://young-tree-0724.yongping0719.workers.dev
+ */
+const WORKER_BASE = process.env.CF_WORKER_BASE_URL || "https://young-tree-0724.yongping0719.workers.dev";
+
+// 橙云拿 RSS 原文时可能比较慢，给它一个合理超时（10~15 秒）
+const UPSTREAM_TIMEOUT_MS = Number(process.env.CF_WORKER_TIMEOUT_MS || 15000);
+
 export async function GET(req: Request) {
+  const url = new URL(req.url);
+  const src = normalizeSrc(url.searchParams.get("src"));
+
+  // 组装橙云请求地址：/ ?src=xxx
+  const workerUrl = new URL(WORKER_BASE);
+  workerUrl.searchParams.set("src", src);
+
+  const { signal, clear } = withTimeout(UPSTREAM_TIMEOUT_MS);
+
   try {
-    const { searchParams } = new URL(req.url);
-    const srcRaw = (searchParams.get("src") || "nhk").toLowerCase();
-
-    if (!ALLOWED.has(srcRaw)) {
-      return NextResponse.json(
-        { ok: false, error: `Unknown src: ${srcRaw}` },
-        { status: 400 }
-      );
-    }
-
-    // ✅ 只请求 Worker，不请求任何 RSS 源站
-    const workerUrl = `${WORKER_BASE.replace(/\/$/, "")}/?src=${encodeURIComponent(
-      srcRaw
-    )}`;
-
-    const wRes = await fetch(workerUrl, {
-      cache: "no-store",
+    const res = await fetch(workerUrl.toString(), {
+      method: "GET",
+      signal,
       headers: {
-        // 让 Worker/中间层更像正常请求（可有可无）
-        "Accept": "application/json,text/plain,*/*",
+        // 给橙云/上游一个更像浏览器的 UA（部分站点会挑 UA）
+        "user-agent": "Mozilla/5.0 (RSS Proxy via Cloudflare Worker)",
+        accept: "application/json,text/plain,*/*",
       },
+      // next/node 环境下显式禁用缓存更直观
+      cache: "no-store",
     });
 
-    const wText = await wRes.text();
+    clear();
 
-    // Worker 理想返回：{ ok:true, source:"nhk", rss:"<xml...>" }
-    // 但也兼容 Worker 直接返回 XML 文本
-    let payload: any = null;
-    try {
-      payload = JSON.parse(wText);
-    } catch {
-      payload = null;
-    }
-
-    // 如果是 JSON 且 ok=false，直接把错误透传给前端（保持你现在的红字逻辑）
-    if (payload && payload.ok === false) {
-      const msg = payload.error || "Worker returned ok=false";
-      return NextResponse.json(
-        { ok: false, error: msg, detail: payload },
-        { status: 502 }
+    // 只要橙云不是 2xx，就不要把它的错误原文透传到前端（避免红字/泄漏）
+    if (!res.ok) {
+      return jsonOk(
+        {
+          ok: false,
+          source: src,
+          items: [],
+          error: `Worker upstream not ok (${res.status})`,
+        },
+        { status: 200 }
       );
     }
 
-    // 拿到 RSS XML 字符串
-    const rssXml =
-      (payload && typeof payload.rss === "string" && payload.rss) ||
-      // 兼容：Worker 直接返回 XML
-      (typeof wText === "string" ? wText : "");
+    // 橙云可能返回：
+    // 1) 你未来会改成 JSON（建议）
+    // 2) 现在还是原始 RSS/XML 文本（也可以先凑合）
+    //
+    // 所以这里：优先尝试 JSON；失败就把文本包装一下返回
+    const contentType = res.headers.get("content-type") || "";
+    if (contentType.includes("application/json")) {
+      let data: any = null;
+      try {
+        data = await res.json();
+      } catch {
+        return jsonOk(
+          { ok: false, source: src, items: [], error: "Worker JSON parse failed" },
+          { status: 200 }
+        );
+      }
 
-    if (!rssXml || !rssXml.includes("<")) {
-      return NextResponse.json(
-        { ok: false, error: "No RSS XML received from Worker", sample: wText?.slice?.(0, 200) },
-        { status: 502 }
+      // 兜底：不让前端因为结构不对而崩
+      if (!data || typeof data !== "object") {
+        return jsonOk(
+          { ok: false, source: src, items: [], error: "Worker JSON invalid" },
+          { status: 200 }
+        );
+      }
+
+      // 如果橙云已经返回 { ok:true, items:[...] } 这种结构，直接透传
+      // 否则也做一层规范化
+      const ok = Boolean((data as any).ok);
+      const items = Array.isArray((data as any).items) ? (data as any).items : [];
+
+      return jsonOk(
+        {
+          ok,
+          source: (data as any).source || src,
+          items,
+          // 可选：保留 message/error 字段，但不给前端展示原始上游 HTML
+          error: ok ? "" : String((data as any).error || ""),
+        },
+        { status: 200 }
       );
     }
 
-    // 解析 RSS
-    const parser = new XMLParser({
-      ignoreAttributes: false,
-      attributeNamePrefix: "@_",
-      // 允许各种奇怪的 RSS
-      removeNSPrefix: true,
-      parseTagValue: true,
-      parseAttributeValue: true,
-      trimValues: true,
-    });
+    // 非 JSON：当作文本（RSS/XML）返回，但为了“前端稳定”，依然包装成统一 JSON
+    const text = await res.text();
 
-    const parsed = parser.parse(rssXml);
-    const items = pickItems(parsed);
+    return jsonOk(
+      {
+        ok: true,
+        source: src,
+        // 你现在前端如果还在用 fast-xml-parser 解析 RSS，
+        // 可以改为：在前端解析 text（但你说“只读橙云”，所以先把数据放这里）
+        rssText: text,
+        items: [],
+      },
+      { status: 200 }
+    );
+  } catch (e: any) {
+    clear();
 
-    return NextResponse.json({
-      ok: true,
-      source: srcRaw,
-      worker: workerUrl,
-      count: items.length,
-      items,
-    });
-  } catch (err: any) {
-    return NextResponse.json(
-      { ok: false, error: err?.message || String(err) },
-      { status: 500 }
+    // 超时 / 网络错误 / 橙云宕机：统一返回“空数据”，前端不红字
+    const isAbort = e?.name === "AbortError";
+
+    return jsonOk(
+      {
+        ok: false,
+        source: src,
+        items: [],
+        error: isAbort ? "Worker request timeout" : "Worker request failed",
+      },
+      { status: 200 }
     );
   }
 }
