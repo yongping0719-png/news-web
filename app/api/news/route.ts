@@ -1,152 +1,49 @@
-// app/api/news/route.ts
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 
-export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
+// ✅ 只做转发，不在 V网页 侧抓 RSS
+// ✅ 默认走你当前的橙云域名（可改成环境变量更安全）
+const WORKER_BASE =
+  process.env.WORKER_BASE_URL?.replace(/\/$/, "") ||
+  "https://young-tree-0724.yongping0719.workers.dev";
 
-type Src = "nhk" | "kyodo" | "yahoo" | "cnn";
+const ALLOWED = new Set(["nhk", "yahoo", "kyodo", "cnn"]);
 
-function normalizeSrc(raw: string | null): Src {
-  const v = (raw || "nhk").toLowerCase().trim();
-  if (v === "nhk" || v === "kyodo" || v === "yahoo" || v === "cnn") return v;
-  return "nhk";
-}
-
-function jsonOk(payload: unknown, init?: ResponseInit) {
-  return NextResponse.json(payload, {
-    ...init,
-    headers: {
-      "cache-control": "no-store",
-      ...(init?.headers || {}),
-    },
-  });
-}
-
-_toggle:
-function withTimeout(ms: number) {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), ms);
-  return { signal: ctrl.signal, clear: () => clearTimeout(timer) };
-}
-
-/**
- * 你要把下面这个地址改成你自己的橙云地址（workers.dev）
- * 例如：
- *   https://young-tree-0724.yongping0719.workers.dev
- */
-const WORKER_BASE = process.env.CF_WORKER_BASE_URL || "https://young-tree-0724.yongping0719.workers.dev";
-
-// 橙云拿 RSS 原文时可能比较慢，给它一个合理超时（10~15 秒）
-const UPSTREAM_TIMEOUT_MS = Number(process.env.CF_WORKER_TIMEOUT_MS || 15000);
-
-export async function GET(req: Request) {
-  const url = new URL(req.url);
-  const src = normalizeSrc(url.searchParams.get("src"));
-
-  // 组装橙云请求地址：/ ?src=xxx
-  const workerUrl = new URL(WORKER_BASE);
-  workerUrl.searchParams.set("src", src);
-
-  const { signal, clear } = withTimeout(UPSTREAM_TIMEOUT_MS);
-
+export async function GET(req: NextRequest) {
   try {
-    const res = await fetch(workerUrl.toString(), {
-      method: "GET",
-      signal,
-      headers: {
-        // 给橙云/上游一个更像浏览器的 UA（部分站点会挑 UA）
-        "user-agent": "Mozilla/5.0 (RSS Proxy via Cloudflare Worker)",
-        accept: "application/json,text/plain,*/*",
-      },
-      // next/node 环境下显式禁用缓存更直观
+    const { searchParams } = new URL(req.url);
+    const srcRaw = (searchParams.get("src") || "nhk").toLowerCase();
+    const src = ALLOWED.has(srcRaw) ? srcRaw : "nhk";
+
+    // ✅ 关键：永远只请求橙云
+    const workerUrl = `${WORKER_BASE}/api/news?src=${encodeURIComponent(src)}`;
+
+    const res = await fetch(workerUrl, {
+      // V网页这边不缓存，让橙云自己缓存（你橙云里已经配了 cf cacheTtl）
       cache: "no-store",
+      headers: {
+        Accept: "application/json",
+      },
     });
 
-    clear();
-
-    // 只要橙云不是 2xx，就不要把它的错误原文透传到前端（避免红字/泄漏）
-    if (!res.ok) {
-      return jsonOk(
-        {
-          ok: false,
-          source: src,
-          items: [],
-          error: `Worker upstream not ok (${res.status})`,
-        },
-        { status: 200 }
-      );
-    }
-
-    // 橙云可能返回：
-    // 1) 你未来会改成 JSON（建议）
-    // 2) 现在还是原始 RSS/XML 文本（也可以先凑合）
-    //
-    // 所以这里：优先尝试 JSON；失败就把文本包装一下返回
-    const contentType = res.headers.get("content-type") || "";
-    if (contentType.includes("application/json")) {
-      let data: any = null;
-      try {
-        data = await res.json();
-      } catch {
-        return jsonOk(
-          { ok: false, source: src, items: [], error: "Worker JSON parse failed" },
-          { status: 200 }
-        );
-      }
-
-      // 兜底：不让前端因为结构不对而崩
-      if (!data || typeof data !== "object") {
-        return jsonOk(
-          { ok: false, source: src, items: [], error: "Worker JSON invalid" },
-          { status: 200 }
-        );
-      }
-
-      // 如果橙云已经返回 { ok:true, items:[...] } 这种结构，直接透传
-      // 否则也做一层规范化
-      const ok = Boolean((data as any).ok);
-      const items = Array.isArray((data as any).items) ? (data as any).items : [];
-
-      return jsonOk(
-        {
-          ok,
-          source: (data as any).source || src,
-          items,
-          // 可选：保留 message/error 字段，但不给前端展示原始上游 HTML
-          error: ok ? "" : String((data as any).error || ""),
-        },
-        { status: 200 }
-      );
-    }
-
-    // 非 JSON：当作文本（RSS/XML）返回，但为了“前端稳定”，依然包装成统一 JSON
     const text = await res.text();
 
-    return jsonOk(
-      {
-        ok: true,
-        source: src,
-        // 你现在前端如果还在用 fast-xml-parser 解析 RSS，
-        // 可以改为：在前端解析 text（但你说“只读橙云”，所以先把数据放这里）
-        rssText: text,
-        items: [],
-      },
-      { status: 200 }
-    );
-  } catch (e: any) {
-    clear();
+    // 直接透传橙云的 JSON
+    // 如果橙云返回的不是 JSON，也原样返回，方便排错
+    const contentType = res.headers.get("content-type") || "application/json; charset=utf-8";
 
-    // 超时 / 网络错误 / 橙云宕机：统一返回“空数据”，前端不红字
-    const isAbort = e?.name === "AbortError";
-
-    return jsonOk(
-      {
-        ok: false,
-        source: src,
-        items: [],
-        error: isAbort ? "Worker request timeout" : "Worker request failed",
+    return new NextResponse(text, {
+      status: res.status,
+      headers: {
+        "content-type": contentType,
+        "access-control-allow-origin": "*",
+        // 可选：给浏览器/边缘一点点缓存（你要更实时可以删掉）
+        "cache-control": "public, max-age=0, s-maxage=60",
       },
-      { status: 200 }
+    });
+  } catch (e) {
+    return NextResponse.json(
+      { ok: false, error: "V网页 api route exception", message: String(e) },
+      { status: 500 }
     );
   }
 }
