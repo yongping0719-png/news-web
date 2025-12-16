@@ -1,49 +1,77 @@
-import { NextRequest, NextResponse } from "next/server";
+// app/api/news/route.ts
+import { NextResponse } from "next/server";
 
-// ✅ 只做转发，不在 V网页 侧抓 RSS
-// ✅ 默认走你当前的橙云域名（可改成环境变量更安全）
-const WORKER_BASE =
-  process.env.WORKER_BASE_URL?.replace(/\/$/, "") ||
-  "https://young-tree-0724.yongping0719.workers.dev";
+export const runtime = "nodejs";
 
-const ALLOWED = new Set(["nhk", "yahoo", "kyodo", "cnn"]);
+function withCors(res: NextResponse) {
+  // 同源一般用不到，但加上不坏事，方便以后你前后端分离
+  res.headers.set("Access-Control-Allow-Origin", "*");
+  res.headers.set("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.headers.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  return res;
+}
 
-export async function GET(req: NextRequest) {
+export async function OPTIONS() {
+  return withCors(new NextResponse(null, { status: 204 }));
+}
+
+export async function GET(req: Request) {
   try {
-    const { searchParams } = new URL(req.url);
-    const srcRaw = (searchParams.get("src") || "nhk").toLowerCase();
-    const src = ALLOWED.has(srcRaw) ? srcRaw : "nhk";
+    const url = new URL(req.url);
+    const src = (url.searchParams.get("src") || "nhk").toLowerCase();
 
-    // ✅ 关键：永远只请求橙云
-    const workerUrl = `${WORKER_BASE}/api/news?src=${encodeURIComponent(src)}`;
+    // 你的橙云域名（可选：你也可以在 V网页 的环境变量里设置 NEWS_WORKER_BASE）
+    const WORKER_BASE =
+      process.env.NEWS_WORKER_BASE ||
+      "https://young-tree-0724.yongping0719.workers.dev";
 
-    const res = await fetch(workerUrl, {
-      // V网页这边不缓存，让橙云自己缓存（你橙云里已经配了 cf cacheTtl）
-      cache: "no-store",
+    const base = WORKER_BASE.replace(/\/+$/, "");
+    const target = `${base}/api/news?src=${encodeURIComponent(src)}`;
+
+    // 关键：这里只做“代理”，不做任何 RSS/XML 解析
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 12000);
+
+    const upstream = await fetch(target, {
+      method: "GET",
       headers: {
         Accept: "application/json",
       },
-    });
+      signal: controller.signal,
+      // 让 V网页 不缓存旧数据（需要缓存的话我们下一步再加 s-maxage）
+      cache: "no-store",
+    }).finally(() => clearTimeout(timer));
 
-    const text = await res.text();
+    const text = await upstream.text();
 
-    // 直接透传橙云的 JSON
-    // 如果橙云返回的不是 JSON，也原样返回，方便排错
-    const contentType = res.headers.get("content-type") || "application/json; charset=utf-8";
+    // 尝试按 JSON 返回；如果上游不是 JSON，就包一层错误返回
+    let data: any;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = {
+        ok: false,
+        error: "Upstream returned non-JSON",
+        status: upstream.status,
+        target,
+        sample: text.slice(0, 500),
+      };
+    }
 
-    return new NextResponse(text, {
-      status: res.status,
-      headers: {
-        "content-type": contentType,
-        "access-control-allow-origin": "*",
-        // 可选：给浏览器/边缘一点点缓存（你要更实时可以删掉）
-        "cache-control": "public, max-age=0, s-maxage=60",
+    // 把橙云的结果原样返回给前端
+    const res = NextResponse.json(data, { status: upstream.ok ? 200 : 502 });
+    res.headers.set("Cache-Control", "no-store");
+    return withCors(res);
+  } catch (err: any) {
+    const res = NextResponse.json(
+      {
+        ok: false,
+        error: "V网页 api proxy failed",
+        message: err?.message || String(err),
       },
-    });
-  } catch (e) {
-    return NextResponse.json(
-      { ok: false, error: "V网页 api route exception", message: String(e) },
       { status: 500 }
     );
+    res.headers.set("Cache-Control", "no-store");
+    return withCors(res);
   }
 }
